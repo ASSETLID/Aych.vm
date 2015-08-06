@@ -26,6 +26,8 @@ let getenv_term () =
   let term_var = "TERM" in (* This variable does not exist on windows. *)
   try Some (Sys.getenv term_var) with Not_found -> None
 
+let path_sep = if Sys.win32 then ";" else ":"
+
 let getenv_path () =
   let path_var = "PATH" in (* Same variable on windows *)
   try Some (Sys.getenv path_var) with Not_found -> None
@@ -126,24 +128,6 @@ let with_umask umask f =
 let with_umask umask f =
   if Sys.win32 then f () else with_umask umask f
 
-let with_timeout timeout ~on_timeout ~do_ =
-  let old_handler = ref Sys.Signal_default in
-  let old_timeout = ref 0 in
-  Utils.with_context
-    ~enter:(fun () ->
-        old_handler := Sys.signal Sys.sigalrm (Sys.Signal_handle on_timeout);
-        old_timeout := Unix.alarm timeout)
-    ~exit:(fun () ->
-        ignore (Unix.alarm !old_timeout);
-        Sys.set_signal Sys.sigalrm !old_handler)
-    ~do_
-
-let with_timeout timeout ~on_timeout ~do_ =
-  if Sys.win32 then
-    do_ () (* TODO *)
-  else
-    with_timeout timeout ~on_timeout ~do_
-
 let read_stdin_to_string () =
   let buf = Buffer.create 4096 in
   try
@@ -196,7 +180,7 @@ let executable_path : unit -> string =
       match getenv_path () with
         | None -> failwith "Unable to determine executable path"
         | Some paths ->
-          Str.split (Str.regexp_string ":") paths in
+          Str.split (Str.regexp_string path_sep) paths in
     let path = List.fold_left paths ~f:begin fun acc p ->
       match acc with
       | Some _ -> acc

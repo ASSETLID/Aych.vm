@@ -25,11 +25,19 @@ type config = {
 
 val default_config : config
 
+type handle
+
 (*****************************************************************************)
 (* Initializes the shared memory. Must be called before forking! *)
 (*****************************************************************************)
 
-val init: config -> unit
+val init: config -> handle
+
+(*****************************************************************************)
+(* Connect a Windows slave to the chared heap *)
+(*****************************************************************************)
+
+val connect: handle -> unit
 
 (*****************************************************************************)
 (* The shared memory garbage collector. It must be called every time we

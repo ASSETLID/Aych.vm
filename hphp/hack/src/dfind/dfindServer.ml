@@ -52,7 +52,13 @@ let (process_fsnotify_event:
   let dirty = SSet.union env.new_files dirty in
   dirty
 
-let run_daemon roots (ic, oc) =
+type r = Init of Path.t list | Request
+
+let run_daemon (ic, oc) =
+  let roots =
+    match Daemon.from_channel ic with
+    | Init roots -> roots
+    | Request -> assert false in
   let roots = List.map roots Path.to_string in
   let env = DfindEnv.make roots in
   List.iter roots (DfindAddFile.path env);
@@ -64,7 +70,8 @@ let run_daemon roots (ic, oc) =
     in
     let message_in_callback () =
       (* XXX can we just select() on the writability of the oc? *)
-      let () = Daemon.from_channel ic in
+      let _r = Daemon.from_channel ic in
+      assert (_r = Request);
       Daemon.to_channel oc !acc;
       acc := SSet.empty
     in
@@ -72,3 +79,6 @@ let run_daemon roots (ic, oc) =
     let timeout = -1.0 in
     Fsnotify.select env.fsnotify ~read_fdl ~timeout fsnotify_callback
   done
+
+let entry_point =
+  Daemon.register_entry_point "dfind" run_daemon

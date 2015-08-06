@@ -10,4 +10,6 @@
 
 open Utils
 
-val run_daemon: Path.t list -> (unit, SSet.t) Daemon.channel_pair -> unit
+type r = Init of Path.t list | Request
+val run_daemon: (r, SSet.t) Daemon.channel_pair -> unit
+val entry_point: (r, SSet.t) Daemon.entry

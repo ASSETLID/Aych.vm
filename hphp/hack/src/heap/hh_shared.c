@@ -253,25 +253,10 @@ value hh_hash_slots() {
  */
 /*****************************************************************************/
 
-static void init_shared_globals(char* mem) {
+static void define_globals(char* mem) {
   size_t page_size = getpagesize();
 
-#ifdef _WIN32
-  if (!VirtualAlloc(mem,
-                    global_size_b + page_size +
-                      2 * DEP_SIZE_B + HASHTBL_SIZE_B,
-                    MEM_COMMIT, PAGE_READWRITE)) {
-    win32_maperr(GetLastError());
-    uerror("VirtualAlloc2", Nothing);
-  }
-#endif
-
-  /* Global storage initialization:
-   * We store this at the start of the shared memory section as it never
-   * needs to get saved (always reset after each typechecking run) */
   global_storage = (value*)mem;
-  // Initial size is zero
-  global_storage[0] = 0;
   mem += global_size_b;
 
   /* BEGINNING OF THE SMALL OBJECTS PAGE
@@ -287,10 +272,7 @@ static void init_shared_globals(char* mem) {
 
   // The number of elements in the hashtable
   hcounter = (int*)(mem + CACHE_LINE_SIZE);
-  *hcounter = 0;
-
   counter = (uintptr_t*)(mem + 2*CACHE_LINE_SIZE);
-  *counter = early_counter + 1;
 
   mem += page_size;
   // Just checking that the page is large enough.
@@ -310,8 +292,31 @@ static void init_shared_globals(char* mem) {
 
   /* Heap */
   heap_init = mem;
-  *heap = mem;
+
 }
+
+static void init_shared_globals(char* mem) {
+
+  define_globals(mem);
+
+#ifdef _WIN32
+  if (!VirtualAlloc(mem, heap_init - mem,
+                    MEM_COMMIT, PAGE_READWRITE)) {
+    win32_maperr(GetLastError());
+    uerror("VirtualAlloc2", Nothing);
+  }
+#endif
+
+  // Initial size is zero for global storage is zero
+  global_storage[0] = 0;
+  // Initialize the number of element in the table
+  *hcounter = 0;
+  *counter = early_counter + 1;
+  // Initialize top heap pointers
+  *heap = heap_init;
+
+}
+
 
 /*****************************************************************************/
 /* Sets CPU and IO priorities. */
@@ -366,6 +371,7 @@ value hh_shared_init(
 ) {
 
   CAMLparam2(global_size_val, heap_size_val);
+  CAMLlocal1(connector);
 
   global_size_b = Long_val(global_size_val);
   heap_size = Long_val(heap_size_val);
@@ -425,7 +431,17 @@ value hh_shared_init(
     uerror("MapViewOfFileEx", Nothing);
   }
 
+  master_pid = 0;
+  my_pid = master_pid;
+
+  connector = caml_alloc_tuple(3);
+  Field(connector, 0) = Val_long(handle);
+  Field(connector, 1) = global_size_val;
+  Field(connector, 2) = heap_size_val;
+
 #else /* _WIN32 */
+
+  connector = Val_unit;
 
   /* MAP_NORESERVE is because we want a lot more virtual memory than what
    * we are actually going to use.
@@ -475,8 +491,18 @@ value hh_shared_init(
 
   set_priorities();
 
-  CAMLreturn(Val_unit);
+  CAMLreturn(connector);
 }
+
+value hh_heap_connect(value handle) {
+
+#ifdef _WIN32
+
+#endif
+  return Val_unit;
+
+}
+
 
 #ifdef NO_LZ4
 void hh_save(value out_filename) {
@@ -650,10 +676,31 @@ void hh_load(value in_filename) {
 #endif /* NO_LZ4 */
 
 /* Must be called by every worker before any operation is performed */
-void hh_worker_init() {
-#ifndef _WIN32
+value hh_worker_init(value connector) {
+  CAMLparam1(connector);
+#ifdef _WIN32
+  char *shared_mem;
+  HANDLE handle = (HANDLE)Long_val(Field(connector, 0));
+  global_size_b = Long_val(Field(connector, 1));
+  heap_size = Long_val(Field(connector, 2));
+  shared_mem = MapViewOfFileEx(
+    handle,
+    FILE_MAP_ALL_ACCESS,
+    0, 0,
+    0,
+    (char *)SHARED_MEM_INIT);
+  if (shared_mem != (char *)SHARED_MEM_INIT) {
+    shared_mem = NULL;
+    win32_maperr(GetLastError());
+    uerror("MapViewOfFileEx", Nothing);
+  }
+  define_globals(shared_mem);
+  my_pid = 1; // Trick
+#else
+  // On unix, we forked, nothing to do.
   my_pid = getpid();
 #endif
+  CAMLreturn(Val_unit);
 }
 
 /*****************************************************************************/
@@ -852,29 +899,34 @@ void hh_call_after_init() {
  */
 /*****************************************************************************/
 void hh_collect() {
-#ifdef _WIN32
-  // TODO GRGR
-  return;
-#else
-  int flags       = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
-  int prot        = PROT_READ | PROT_WRITE;
+  char* tmp_heap;
   char* dest;
   size_t mem_size = 0;
-  char* tmp_heap;
+#ifndef _WIN32
+  int flags       = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+  int prot        = PROT_READ | PROT_WRITE;
+#endif
 
   if(used_heap_size() < 2 * heap_init_size) {
     // We have not grown past twice the size of the initial size
     return;
   }
 
+#ifdef _WIN32
+  tmp_heap = VirtualAlloc(NULL, heap_size, MEM_RESERVE, PAGE_READWRITE);
+  if (!tmp_heap) {
+    win32_maperr(GetLastError());
+    uerror("VirtualAlloc3", Nothing);
+  }
+#else
   tmp_heap = (char*)mmap(NULL, heap_size, prot, flags, 0, 0);
-  dest = tmp_heap;
-
   if(tmp_heap == MAP_FAILED) {
     printf("Error while collecting: %s\n", strerror(errno));
     exit(2);
   }
+#endif
 
+  dest = tmp_heap;
   assert(my_pid == master_pid); // Comes from the master
 
   // Walking the table
@@ -885,6 +937,12 @@ void hh_collect() {
       size_t aligned_size = ALIGNED(bl_size);
       char* addr          = Get_buf(hashtbl[i].addr);
 
+      #ifdef _WIN32
+      if (!VirtualAlloc(dest, bl_size, MEM_COMMIT, PAGE_READWRITE)) {
+        win32_maperr(GetLastError());
+        uerror("VirtualAlloc4", Nothing);
+      }
+      #endif
       memcpy(dest, addr, bl_size);
       // This is where the data ends up after the copy
       hashtbl[i].addr = heap_init + mem_size + sizeof(size_t);
@@ -897,6 +955,12 @@ void hh_collect() {
   memcpy(heap_init, tmp_heap, mem_size);
   *heap = heap_init + mem_size;
 
+#ifdef _WIN32
+  if(!VirtualFree(tmp_heap, 0, MEM_RELEASE)) {
+    win32_maperr(GetLastError());
+    uerror("VirtualFree", Nothing);
+  }
+#else
   if(munmap(tmp_heap, heap_size) == -1) {
     printf("Error while collecting: %s\n", strerror(errno));
     exit(2);

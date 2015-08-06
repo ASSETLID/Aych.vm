@@ -33,24 +33,21 @@ type t
 type 'a handle
 
 (* Creates a worker *)
-val make: int -> Gc.control -> t list
+val make: int -> Gc.control -> SharedMem.handle -> t list
 
 (* Call in a sub-process (CAREFUL, GLOBALS ARE COPIED) *)
 val call: t -> ('a -> 'b) -> 'a -> 'b handle
 
 (* Retrieves the result (once the worker is done) hangs otherwise *)
-val get_result: t -> 'a handle -> 'a
+val get_result: 'a handle -> 'a
 
 (* Selects among multiple process those which are ready *)
-val select: t list -> t list
+type 'a selected = {
+  readys: 'a handle list;
+  waiters: 'a handle list;
+}
+val select: 'a handle list -> 'a selected
 
-(* Gives back the Unix process ID of a process *)
-val get_pid: t -> int
+val get_worker: 'a handle -> t
 
-(* Returns the file descriptor used by the master process to receive results
- * from the child. (cf hh_server.ml section on pipes)
- *)
-val get_file_descr: t -> Unix.file_descr
-
-(* Kills the worker with kill -9 *)
-val kill: t -> unit
+val killall: unit -> unit

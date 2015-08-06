@@ -373,3 +373,6 @@ let assert_false_log_backtrace () =
   Printf.eprintf "%s" (Printexc.raw_backtrace_to_string
     (Printexc.get_callstack 100));
   assert false
+
+(* See entry points in `serverMain.mls and in `worker.ml` *)
+let magic_var = "HH_SERVER_MAIN"

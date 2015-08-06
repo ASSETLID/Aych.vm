@@ -15,8 +15,8 @@ external get_embedded_hhi_data : string -> string option =
 let root = ref None
 
 let touch_root r =
-  let r = Filename.quote (Path.to_string r) in
-  ignore (Unix.system ("find " ^ r ^ " -name '*.hhi' -exec touch '{}' ';'"))
+  let filter file = Filename.check_suffix file ".hhi" in
+  Find.iter_files ~filter [ r ] Sys_utils.try_touch
 
 let touch () =
   match !root with
@@ -46,10 +46,22 @@ let extract_external () =
     Path.concat (Path.dirname Path.executable_name) "/../hhi.tar.gz" in
   if Path.file_exists path then Some (extract (Path.cat path)) else None
 
+let extract_win32_res () =
+  match Hhi_win32res.read_index () with
+  | None -> None
+  | Some idx ->
+    let tmpdir = Path.make (Tmp.temp_dir GlobalConfig.tmp_dir "hhi") in
+    Hhi_win32res.dump_files tmpdir idx;
+    touch_root tmpdir;
+    Some tmpdir
+
 let get_hhi_root_impl () =
-  match extract_embedded () with
-  | Some path -> Some path
-  | None -> extract_external ()
+  if Sys.win32 then
+    extract_win32_res ()
+  else
+    match extract_embedded () with
+    | Some path -> Some path
+    | None -> extract_external ()
 
 (* We want this to be idempotent so that later code can check if a given file
  * came from the hhi unarchive directory or not, to provide better error

@@ -8,21 +8,58 @@
  *
  *)
 
-(* Type-safe versions of the channels in Pervasives. *)
+(** Type-safe versions of the channels in Pervasives. *)
+
 type 'a in_channel
 type 'a out_channel
 type ('in_, 'out) channel_pair = 'in_ in_channel * 'out out_channel
+
+val to_channel :
+  'a out_channel -> ?flags:Marshal.extern_flags list -> ?flush:bool ->
+  'a -> unit
+val from_channel : 'a in_channel -> 'a
+val flush : 'a out_channel -> unit
+
+(* This breaks the type safety, but is necessary in order to allow select() *)
+val descr_of_in_channel : 'a in_channel -> Unix.file_descr
+val descr_of_out_channel : 'a out_channel -> Unix.file_descr
+val cast_in : 'a in_channel -> Pervasives.in_channel
+val cast_out : 'a out_channel -> Pervasives.out_channel
+
+(** Spawning new process *)
+
+(* In the absence of 'fork' on Windows, its usage must be restricted
+   to Unix specifics parts.
+
+   This module provides a mechanism to "spawn" new instance of the
+   current program, but with a custom entry point (e.g. Slaves,
+   DfindServer, ...)
+
+   On Unix 'spawn' is based on 'fork', but obviously not on Windows,
+   where it relies on 'Unix.create_process'.  Then, alternate entry
+   points should not depend on global references that may not have
+   been (re)initialised in the new process.
+
+   All required data must be passed through the typed channels.
+   associated to the spawned process.
+
+ *)
+
+(* abstract data type for entry point *)
+type ('a, 'b) entry
+
+(* Entry point must be registered at toplevel, i.e. every call to
+  `Daemon.register_entry_point` must have been evaluated when
+  `Daemon.check_entry_point` is called at the beginning of
+  `ServerMain.start`. *)
+val register_entry_point :
+  string -> (('a, 'b) channel_pair -> unit) -> ('a, 'b) entry
+
+(* Handler upon spawn and forked process. *)
 type ('in_, 'out) handle = {
   channels : ('in_, 'out) channel_pair;
   pid : int;
 }
-
-val to_channel : 'a out_channel -> ?flush:bool -> 'a -> unit
-val from_channel : 'a in_channel -> 'a
-val flush : 'a out_channel -> unit
-(* This breaks the type safety, but is necessary in order to allow select() *)
-val descr_of_in_channel : 'a in_channel -> Unix.file_descr
-val descr_of_out_channel : 'a out_channel -> Unix.file_descr
 
 (* Fork and run a function that communicates via the typed channels *)
 val fork : ?log_file:string -> (('a, 'b) channel_pair -> unit) ->
@@ -30,3 +67,27 @@ val fork : ?log_file:string -> (('a, 'b) channel_pair -> unit) ->
 
 (* for unit tests *)
 val devnull : unit -> ('a, 'b) handle
+
+(* Spawn a new instance of the current process, and execute the
+   alternate entry point. *)
+val spawn :
+  ?reason:string -> ?log_file:string ->
+  ('a, 'b) entry -> ('b, 'a) handle
+
+(* Register a file descriptor to be closed in a 'spawned' child.
+   Warning: the file descriptor must be manually unregistred when closed. *)
+val set_close_on_spawn : Unix.file_descr -> unit
+
+(* Unregister a file descriptor to be closed in a 'spawned' child. *)
+val clear_close_on_spawn : Unix.file_descr -> unit
+
+(* Close the typed channels associated to a 'spawned' child. *)
+val close : ('a, 'b) handle -> unit
+
+(* Kill a 'spawned' child and close the associated typed channels. *)
+val kill : ('a, 'b) handle -> unit
+
+(* Main function, that execute a alternate entry point.
+   It should be called only once. Just before the main entry point.
+   This function do not returns if a custom entry point is selected. *)
+val check_entry_point : unit -> unit

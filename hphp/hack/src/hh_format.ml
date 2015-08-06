@@ -75,11 +75,8 @@ let debug () fnl =
         Printf.eprintf
           "Applying the formatter twice lead to different results: %s\n%!"
           (filepath :> string);
-        let () = Random.self_init() in
-        let nbr = string_of_int (Random.int 100000) in
-        let tmp = "/tmp/xx_"^nbr in
-        let file1 = tmp^"_1.php" in
-        let file2 = tmp^"_2.php" in
+        let file1 = Filename.temp_file "xx_" "_1.php" in
+        let file2 = Filename.temp_file "xx_" "_2.php" in
         let oc = open_out file1 in
         output_string oc content;
         close_out oc;
@@ -111,12 +108,13 @@ let debug () fnl =
         ()
   end
 
-let debug_directory dir =
+let debug_directory ~handle dir =
   let path = Path.make dir in
   let next = compose
     (List.map ~f:Path.make)
-    (Find.make_next_files FindUtils.is_php path) in
-  let workers = Worker.make GlobalConfig.nbr_procs GlobalConfig.gc_control in
+    (Find.make_next_files ~filter:FindUtils.is_php path) in
+  let workers =
+    Worker.make GlobalConfig.nbr_procs GlobalConfig.gc_control handle in
   MultiWorker.call
     (Some workers)
     ~job:debug
@@ -213,12 +211,13 @@ let job_in_place modes acc fnl =
     | Some err -> err :: acc
   end ~init:acc
 
-let directory modes dir =
+let directory modes ~handle dir =
   let path = Path.make dir in
   let next = compose
     (List.map ~f:Path.make)
-    (Find.make_next_files FindUtils.is_php path) in
-  let workers = Worker.make GlobalConfig.nbr_procs GlobalConfig.gc_control in
+    (Find.make_next_files ~filter:FindUtils.is_php path) in
+  let workers =
+    Worker.make GlobalConfig.nbr_procs GlobalConfig.gc_control handle in
   let messages =
     MultiWorker.call
       (Some workers)
@@ -271,8 +270,8 @@ let format_stdin modes from to_ =
 (*****************************************************************************)
 
 let () =
-  SharedMem.(init default_config);
-  PidLog.log_oc := Some (open_out "/dev/null");
+  let handle = SharedMem.(init default_config) in
+  PidLog.log_oc := Some (open_out (Path.to_string Path.null_path));
   let files, from, to_, apply_mode, debug, diff, modes, root, test =
     parse_args() in
   if not test then FormatEventLogger.init (Unix.time());
@@ -299,8 +298,8 @@ let () =
   | [] -> format_stdin modes from to_
   | [dir] when Sys.is_directory dir ->
       if debug
-      then debug_directory dir
-      else directory modes dir
+      then debug_directory ~handle dir
+      else directory modes ~handle dir
   | [filename] ->
       let filepath = Path.make filename in
       (match apply_mode with

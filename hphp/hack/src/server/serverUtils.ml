@@ -30,6 +30,7 @@ let die_nicely genv =
   HackEventLogger.killed ();
   Printf.printf "Status: Error\n";
   Printf.printf "Sent KILL command by client. Dying.\n";
+  Worker.killall ();
   (match genv.ServerEnv.dfind with
   | Some handle -> Unix.kill (DfindLib.pid handle) Sys.sigterm;
   | None -> ()

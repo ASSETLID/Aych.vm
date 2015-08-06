@@ -21,7 +21,7 @@ module type STOP_CONFIG = sig
   type response
   val server_desc : string
   val server_name : string
-  val kill : in_channel * out_channel -> response
+  val kill : Timeout.in_channel * out_channel -> response
   val response_to_string : response -> string
   val is_expected : response -> bool
 end

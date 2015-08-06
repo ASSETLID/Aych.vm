@@ -8,14 +8,7 @@
  *
  *)
 
-val make_next_files:
-  ?filter:(string -> bool) -> ?others: Path.t list ->
-  Path.t -> (unit -> string list)
+type index
 
-val find:
-  ?max_depth:int -> ?filter:(string -> bool) ->
-  Path.t list -> string list
-
-val iter_files:
-  ?max_depth:int -> ?filter:(string -> bool) ->
-  Path.t list -> (string -> unit) -> unit
+val read_index: unit -> index option
+val dump_files: Path.t -> index -> unit

@@ -10,14 +10,18 @@
 
 open Utils
 
-type t = (SSet.t, unit) Daemon.handle
+type t = (SSet.t, DfindServer.r) Daemon.handle
 
-let init roots = Daemon.fork (DfindServer.run_daemon roots)
+let init roots =
+  let {Daemon.channels = (ic, oc); pid = _} as handle =
+    Daemon.spawn DfindServer.entry_point in
+  Daemon.to_channel oc (DfindServer.Init roots);
+  handle
 
 let pid handle = handle.Daemon.pid
 
 let request_changes {Daemon.channels = (ic, oc); pid = _} =
-  Daemon.to_channel oc ();
+  Daemon.to_channel oc DfindServer.Request;
   Daemon.from_channel ic
 
 let get_changes daemon =

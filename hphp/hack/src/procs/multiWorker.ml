@@ -10,7 +10,7 @@
 
 open Core
 
-type 'a nextlist = 
+type 'a nextlist =
   unit -> 'a list
 
 let single_threaded_call job merge neutral next =
@@ -27,41 +27,47 @@ let single_threaded_call job merge neutral next =
   done;
   !acc
 
+
+let multi_threaded_call
+  (type a) (type b)
+  workers (job: b -> a list -> b)
+  (merge: b -> b -> b)
+  (neutral: b)
+  (next: a nextlist) =
+  let rec loop workers handles acc =
+    (* 'worker' represents available workers. *)
+    (* 'handles' represents pendings jobs. *)
+    (* 'acc' are the accumulated results. *)
+    match workers with
+    | [] when handles = [] -> acc
+    | [] ->
+        (* No worker available: wait for some workers to finish. *)
+        let { Worker.readys; waiters } = Worker.select handles in
+        let workers = List.map ~f:Worker.get_worker readys in
+        (* Collect there results. *)
+        let acc =
+          List.fold_left
+            ~f:(fun acc h -> merge (Worker.get_result h) acc)
+            ~init:acc
+            readys in
+        (* And continue.. *)
+        loop workers waiters acc
+    | worker :: workers ->
+        (* At least one worker is available... *)
+        match next () with
+        | [] ->
+            (* ... but no more job to be distributed, let's collect results. *)
+            loop [] handles acc
+        | bucket ->
+            (* ... send a job to the worker.*)
+            let handle =
+              Worker.call worker
+                (fun xl -> job neutral xl)
+                bucket in
+            loop workers (handle :: handles) acc in
+  loop workers [] neutral
+
 let call workers ~job ~merge ~neutral ~next =
   match workers with
   | None -> single_threaded_call job merge neutral next
-  | Some workers ->
-      let acc = ref neutral in
-      let procs = ref workers in
-      let busy = ref 0 in
-      try
-        while true do
-          List.iter !procs begin fun proc ->
-            let bucket = next () in
-            if bucket = [] then raise Exit;
-            incr busy;
-            ignore (Worker.call proc 
-                      begin fun xl ->
-                        job neutral xl
-                      end
-                      bucket
-                   );
-          end;
-          let ready_procs = Worker.select workers in
-          List.iter ready_procs begin fun proc ->
-            let res = Worker.get_result proc (Obj.magic 0) in
-            decr busy;
-            acc := merge res !acc;
-          end;
-          procs := ready_procs;
-        done;
-        assert false
-      with Exit ->
-        while !busy > 0 do
-          List.iter (Worker.select workers) begin fun proc ->
-            let res = Worker.get_result proc (Obj.magic 0) in
-            decr busy;
-            acc := merge res !acc;
-          end;
-        done;
-        !acc
+  | Some workers -> multi_threaded_call workers job merge neutral next

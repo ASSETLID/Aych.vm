@@ -34,28 +34,45 @@ end = struct
   let release_init_lock root =
     ignore(Lock.release (ServerFiles.init_file root))
 
-  let wakeup_client ?(close = false) options msg =
-    match ServerArgs.waiting_client options with
-    | None -> ()
-    | Some oc ->
-        output_string oc (msg ^ "\n");
-        if close then close_out oc else flush oc
+  let wakeup_client oc msg =
+    Option.iter oc
+      ~f:(fun oc ->
+          try
+            output_string oc (msg ^ "\n");
+            flush oc
+          with _ ->
+            (* In case the client don't care... *)
+            ())
+
+  let close_waiting_channel oc =
+    Option.iter oc
+      ~f:(fun oc ->
+          try
+            let fd = Unix.descr_of_out_channel oc in
+            Unix.close fd;
+            Daemon.clear_close_on_spawn fd
+          with exn -> Printf.eprintf "Close: %S\n%!" (Printexc.to_string exn))
 
   (* This code is only executed when the options --check is NOT present *)
   let go options init_fun =
+    let waiting_channel =
+      Option.map
+        (ServerArgs.waiting_client options)
+        ~f:Handle.to_out_channel in
     let root = ServerArgs.root options in
     let t = Unix.gettimeofday () in
     Hh_logger.log "Initializing Server (This might take some time)";
     grab_init_lock root;
-    wakeup_client options "starting";
+    wakeup_client waiting_channel "starting";
     (* note: we only run periodical tasks on the root, not extras *)
     ServerPeriodical.init root;
     let env = init_fun () in
     release_init_lock root;
     Hh_logger.log "Server is READY";
-    wakeup_client ~close:true options "ready";
+    wakeup_client waiting_channel "ready";
     let t' = Unix.gettimeofday () in
     Hh_logger.log "Took %f seconds to initialize." (t' -. t);
+    close_waiting_channel waiting_channel;
     env
 end
 
@@ -112,11 +129,11 @@ module Program : SERVER_PROGRAM =
         Sys.signal Sys.sigusr1 (Sys.Signal_handle Typing.debug_print_last_pos)
 
     let make_next_files dir =
-      let php_next_files = Find.make_next_files FindUtils.is_php dir in
-      let js_next_files = Find.make_next_files FindUtils.is_js dir in
+      let php_next_files = Find.make_next_files ~filter:FindUtils.is_php dir in
+      let js_next_files = Find.make_next_files ~filter:FindUtils.is_js dir in
       fun () -> php_next_files () @ js_next_files ()
 
-    let stamp_file = GlobalConfig.tmp_dir ^ "/stamp"
+    let stamp_file = Filename.concat GlobalConfig.tmp_dir "stamp"
     let touch_stamp () =
       Sys_utils.mkdir_no_fail (Filename.dirname stamp_file);
       Sys_utils.with_umask
@@ -162,10 +179,12 @@ module Program : SERVER_PROGRAM =
         (List.map env.errorl Errors.to_absolute) stdout;
       match ServerArgs.convert genv.options with
       | None ->
-         exit (if env.errorl = [] then 0 else 1)
+          Worker.killall ();
+          exit (if env.errorl = [] then 0 else 1)
       | Some dirname ->
-         ServerConvert.go genv env dirname;
-         exit 0
+          ServerConvert.go genv env dirname;
+          Worker.killall ();
+          exit 0
 
     let process_updates _genv _env updates =
       Relative_path.relativize_set Relative_path.Root updates
@@ -345,28 +364,28 @@ let run_load_script genv env cmd =
         (Filename.quote Build_id.build_id_ohai) in
     Hh_logger.log "Running load script: %s\n%!" cmd;
     let state_fn, to_recheck =
-      let do_fn () =
-        let ic = Unix.open_process_in cmd in
+      let reader timeout ic _oc =
         let state_fn =
-          try input_line ic
+          try Timeout.input_line ~timeout ic
           with End_of_file -> raise State_not_found
         in
         let to_recheck = ref [] in
         begin
           try
             while true do
-              to_recheck := input_line ic :: !to_recheck
+              to_recheck := Timeout.input_line ~timeout ic :: !to_recheck
             done
           with End_of_file -> ()
         end;
-        assert (Unix.close_process_in ic = Unix.WEXITED 0);
+        let rc = Timeout.close_process_in ic in
+        assert (rc = Unix.WEXITED 0);
         state_fn, !to_recheck
       in
-      with_timeout
-        (ServerConfig.load_script_timeout genv.config)
+      Timeout.read_process
+        ~timeout:(ServerConfig.load_script_timeout genv.config)
         ~on_timeout:(fun _ -> failwith "Load script timed out")
-        ~do_:do_fn
-    in
+        ~reader
+        cmd [| cmd |] in
     Hh_logger.log
       "Load state found at %s. %d files to recheck\n%!"
       state_fn (List.length to_recheck);
@@ -416,11 +435,18 @@ let save _genv env fn =
  * type-checker succeeded. So to know if there is some work to be done,
  * we look if env.modified changed.
  *)
-let main options config =
+let daemon_main options =
+  Relative_path.set_path_prefix Relative_path.Root (ServerArgs.root options);
+  let config = Program.load_config () in
   let root = ServerArgs.root options in
   HackEventLogger.init root (Unix.time ());
+  Option.iter
+    (ServerArgs.waiting_client options)
+    ~f:(fun handle ->
+        let fd = Handle.wrap_handle handle in
+        Daemon.set_close_on_spawn fd);
   Program.preinit ();
-  SharedMem.init (ServerConfig.sharedmem_config config);
+  let handle = SharedMem.init (ServerConfig.sharedmem_config config) in
   (* this is to transform SIGPIPE in an exception. A SIGPIPE can happen when
    * someone C-c the client.
    *)
@@ -428,7 +454,7 @@ let main options config =
   PidLog.init (ServerFiles.pids_file root);
   PidLog.log ~reason:"main" (Unix.getpid());
   let watch_paths = root :: Program.get_watch_paths options in
-  let genv = ServerEnvBuild.make_genv options config watch_paths in
+  let genv = ServerEnvBuild.make_genv options config watch_paths handle in
   let env = ServerEnvBuild.make_env options config in
   let program_init = create_program_init genv env in
   let is_check_mode = ServerArgs.check_mode genv.options in
@@ -453,26 +479,41 @@ let main options config =
     let env = MainInit.go options program_init in
     serve genv env socket
 
-let monitor_daemon options f =
+let daemon_entry =
+  Daemon.register_entry_point
+    "daemon"
+    (fun (ic, oc) ->
+       let options = Daemon.from_channel ic in
+       daemon_main options)
+
+let monitor_entry =
+  Daemon.register_entry_point
+    "monitor"
+    (fun (ic, oc) ->
+       let options, log_file = Daemon.from_channel ic in
+       if not Sys.win32 then ignore (Unix.setsid ());
+       let {Daemon.pid; channels = (_, oc)} =
+         Daemon.spawn ~log_file daemon_entry in
+       Daemon.to_channel oc options;
+       let _pid, proc_stat = Unix.waitpid [] pid in
+       (match proc_stat with
+        | Unix.WEXITED 0 -> ()
+        | _ -> HackEventLogger.bad_exit proc_stat))
+
+let monitor_daemon options =
   let log_link = ServerFiles.log_link (ServerArgs.root options) in
   (try Sys.rename log_link (log_link ^ ".old") with _ -> ());
   let log_file = ServerFiles.make_link_of_timestamped log_link in
-  let {Daemon.pid; _} = Daemon.fork begin fun (_ic, _oc) ->
-    ignore @@ Unix.setsid ();
-    let {Daemon.pid; _} = Daemon.fork ~log_file f in
-    let _pid, proc_stat = Unix.waitpid [] pid in
-    (match proc_stat with
-    | Unix.WEXITED 0 -> ()
-    | _ -> HackEventLogger.bad_exit proc_stat)
-  end in
+  let {Daemon.pid; channels = (_, oc)} = Daemon.spawn monitor_entry in
+  Daemon.to_channel oc (options, log_file);
   Printf.eprintf "Spawned %s (child pid=%d)\n" Program.name pid;
-  Printf.eprintf "Logs will go to %s\n%!" log_link;
+  Printf.eprintf "Logs will go to %s\n%!"
+    (if Sys.win32 then log_file else log_link);
   ()
 
 let start () =
+  Daemon.check_entry_point ();
   let options = Program.parse_options () in
-  Relative_path.set_path_prefix Relative_path.Root (ServerArgs.root options);
-  let config = Program.load_config () in
   if ServerArgs.should_detach options
-  then monitor_daemon options (fun (_ic, _oc) -> main options config)
-  else main options config
+  then monitor_daemon options
+  else daemon_main options
