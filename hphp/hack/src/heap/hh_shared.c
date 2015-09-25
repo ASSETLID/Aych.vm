@@ -272,6 +272,14 @@ value hh_hash_slots() {
   CAMLreturn(Val_long(HASHTBL_SIZE));
 }
 
+#ifdef _WIN32
+
+struct timeval log_duration(const char *prefix, struct timeval start_t) {
+   return start_t; // TODO
+}
+
+#else
+
 struct timeval log_duration(const char *prefix, struct timeval start_t) {
   struct timeval end_t;
   gettimeofday(&end_t, NULL);
@@ -282,7 +290,7 @@ struct timeval log_duration(const char *prefix, struct timeval start_t) {
   return end_t;
 }
 
-
+#endif
 
 /**************************************************************************
 
@@ -1368,7 +1376,7 @@ void hh_save_dep_table(value out_filename) {
 void hh_load_dep_table(value in_filename) {
   CAMLparam1(in_filename);
   struct timeval tv;
-  gettimeofday(&tv, NULL);
+  //gettimeofday(&tv, NULL);
 
   FILE* fp = fopen(String_val(in_filename), "rb");
 
