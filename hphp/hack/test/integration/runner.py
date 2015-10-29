@@ -19,9 +19,9 @@ if __name__ == '__main__':
 
     save_suite = unittest.defaultTestLoader.loadTestsFromTestCase(
             test_save_restore.TestSaveRestore)
-    save_mini_suite = unittest.defaultTestLoader.loadTestsFromTestCase(
-            test_save_mini.TestSaveMiniState)
-    save_suite.addTests(save_mini_suite)
+#    save_mini_suite = unittest.defaultTestLoader.loadTestsFromTestCase(
+#            test_save_mini.TestSaveMiniState)
+#    save_suite.addTests(save_mini_suite)
 
     result = unittest.TextTestRunner(verbosity=2).run(save_suite)
     if not result.wasSuccessful():
