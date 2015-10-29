@@ -322,6 +322,10 @@ let setsid =
   if Sys.win32 then Unix.getpid else Unix.setsid
 
 let set_signal = if not Sys.win32 then Sys.set_signal else (fun _ _ -> ())
+let signal =
+  if not Sys.win32
+  then (fun a b -> ignore (Sys.signal a b))
+  else (fun _ _ -> ())
 
 external get_total_ram : unit -> int = "hh_sysinfo_totalram"
 external nproc: unit -> int = "nproc"

@@ -400,9 +400,8 @@ let handle_mode mode filename nenv files_contents files_info errors ai_results =
 (*****************************************************************************)
 
 let main_hack { filename; mode; } =
-  if not Sys.win32 then
-    ignore (Sys.signal Sys.sigusr1
-              (Sys.Signal_handle Typing.debug_print_last_pos));
+  Sys_utils.signal Sys.sigusr1
+    (Sys.Signal_handle Typing.debug_print_last_pos);
   EventLogger.init (Daemon.devnull ()) 0.0;
   let _handle = SharedMem.init_default () in
   let tmp_hhi = Path.concat Path.temp_dir_name "hhi" in
