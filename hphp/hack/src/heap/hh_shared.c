@@ -810,6 +810,50 @@ value hh_get_dep(value dep) {
 /* Garbage collector */
 /*****************************************************************************/
 
+/** Wrappers around mmap/munmap */
+
+#ifdef _WIN32
+
+static char *temp_memory_map(size_t shared_mem_size) {
+  char *tmp_heap;
+  tmp_heap = VirtualAlloc(NULL, heap_size, MEM_RESERVE, PAGE_READWRITE);
+  if (!tmp_heap) {
+    win32_maperr(GetLastError());
+    uerror("VirtualAlloc2", Nothing);
+  }
+  return tmp_heap;
+}
+
+static void temp_memory_unmap(char * tmp_heap) {
+  if(!VirtualFree(tmp_heap, 0, MEM_RELEASE)) {
+    win32_maperr(GetLastError());
+    uerror("VirtualFree", Nothing);
+  }
+}
+
+#else
+
+static char *temp_memory_map(size_t shared_mem_size) {
+  char *tmp_heap;
+  int flags       = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+  int prot        = PROT_READ | PROT_WRITE;
+  tmp_heap = (char*)mmap(NULL, heap_size, prot, flags, 0, 0);
+  if(tmp_heap == MAP_FAILED) {
+    printf("Error while collecting: %s\n", strerror(errno));
+    exit(2);
+  }
+  return tmp_heap;
+}
+
+static void temp_memory_unmap(char * tmp_heap) {
+  if(munmap(tmp_heap, heap_size) == -1) {
+    printf("Error while collecting: %s\n", strerror(errno));
+    exit(2);
+  }
+}
+
+#endif
+
 /*****************************************************************************/
 /* Must be called after the hack server is done initializing.
  * We keep the original size of the heap to estimate how often we should
@@ -836,16 +880,9 @@ void hh_call_after_init() {
  */
 /*****************************************************************************/
 void hh_collect(value aggressive_val) {
-#ifdef _WIN32
-  // TODO GRGR
-  return;
-#else
   int aggressive  = Bool_val(aggressive_val);
-  int flags       = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
-  int prot        = PROT_READ | PROT_WRITE;
-  char* dest;
+  char* tmp_heap, *dest;
   size_t mem_size = 0;
-  char* tmp_heap;
 
   float space_overhead = aggressive ? 1.2 : 2.0;
   if(used_heap_size() < (size_t)(space_overhead * heap_init_size)) {
@@ -853,14 +890,8 @@ void hh_collect(value aggressive_val) {
     return;
   }
 
-  tmp_heap = (char*)mmap(NULL, heap_size, prot, flags, 0, 0);
+  tmp_heap = temp_memory_map(heap_size);
   dest = tmp_heap;
-
-  if(tmp_heap == MAP_FAILED) {
-    printf("Error while collecting: %s\n", strerror(errno));
-    exit(2);
-  }
-
   assert(my_pid == master_pid); // Comes from the master
 
   // Walking the table
@@ -871,6 +902,12 @@ void hh_collect(value aggressive_val) {
       size_t aligned_size = ALIGNED(bl_size);
       char* addr          = Get_buf(hashtbl[i].addr);
 
+#ifdef _WIN32
+      if (!VirtualAlloc(dest, bl_size, MEM_COMMIT, PAGE_READWRITE)) {
+        win32_maperr(GetLastError());
+        uerror("VirtualAlloc3", Nothing);
+      }
+#endif
       memcpy(dest, addr, bl_size);
       // This is where the data ends up after the copy
       hashtbl[i].addr = heap_init + mem_size + sizeof(size_t);
@@ -883,11 +920,8 @@ void hh_collect(value aggressive_val) {
   memcpy(heap_init, tmp_heap, mem_size);
   *heap = heap_init + mem_size;
 
-  if(munmap(tmp_heap, heap_size) == -1) {
-    printf("Error while collecting: %s\n", strerror(errno));
-    exit(2);
-  }
-#endif
+  temp_memory_unmap(tmp_heap);
+
 }
 
 /*****************************************************************************/
@@ -1220,6 +1254,51 @@ static intptr_t decompress(const decompress_args* args) {
   return args->compressed_size == actual_compressed_size;
 }
 
+#ifdef _WIN32
+
+#define pthread_t HANDLE
+
+void join_thread(HANDLE thread)
+{
+  DWORD rc = WaitForSingleObject(thread, INFINITE);
+  if (rc == WAIT_FAILED) {
+    win32_maperr(GetLastError());
+    uerror("WaitForSingleObject", Nothing);
+  }
+  assert(rc == WAIT_OBJECT_0);
+  if(!GetExitCodeThread(thread, &rc)) {
+    win32_maperr(GetLastError());
+    uerror("GetExitCode", Nothing);
+  }
+  assert(rc == 0);
+  CloseHandle(thread);
+}
+
+void create_thread(HANDLE *thread, void* (*f)(void*), void *args)
+{
+  *thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)f, args, 0, NULL);
+}
+
+#else
+
+void join_thread(pthread_t thread)
+{
+  intptr_t success = 0;
+  int rc = pthread_join(thread, (void*)&success);
+  assert(rc == 0);
+  assert(success);
+}
+
+void create_thread(pthread_t *thread, void* (*f)(void*), void *args)
+{
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+  pthread_create(thread, &attr, f, args);
+}
+
+#endif
+
 void hh_load(value in_filename) {
   CAMLparam1(in_filename);
   FILE* fp = fopen(String_val(in_filename), "rb");
@@ -1236,9 +1315,6 @@ void hh_load(value in_filename) {
   read_all(fileno(fp), (void*)&compressed_size, sizeof compressed_size);
   char* chunk_start = save_start();
 
-  pthread_attr_t attr;
-  pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
   pthread_t thread;
   decompress_args args;
   int thread_started = 0;
@@ -1250,30 +1326,17 @@ void hh_load(value in_filename) {
     uintptr_t chunk_size = 0;
     read_all(fileno(fp), (void*)&chunk_size, sizeof chunk_size);
     read_all(fileno(fp), compressed, compressed_size * sizeof(char));
-    if (thread_started) {
-      intptr_t success = 0;
-      int rc = pthread_join(thread, (void*)&success);
-      free(args.compressed);
-      assert(rc == 0);
-      assert(success);
-    }
+    if (thread_started) join_thread(thread);
     args.compressed = compressed;
     args.compressed_size = compressed_size;
     args.decompress_start = chunk_start;
     args.decompressed_size = chunk_size;
-    pthread_create(&thread, &attr, (void* (*)(void*))decompress, &args);
+    create_thread(&thread, (void* (*)(void*))decompress, &args);
     thread_started = 1;
     chunk_start += chunk_size;
     read_all(fileno(fp), (void*)&compressed_size, sizeof compressed_size);
   }
-
-  if (thread_started) {
-    int success;
-    int rc = pthread_join(thread, (void*)&success);
-    free(args.compressed);
-    assert(rc == 0);
-    assert(success);
-  }
+  if (thread_started) join_thread(thread);
 
   fclose(fp);
   CAMLreturn0;
