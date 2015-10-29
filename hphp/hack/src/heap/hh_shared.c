@@ -341,7 +341,14 @@ void memfd_init(char *shm_dir, size_t shared_mem_size) {
   memfd = memfd_create("fb_heap", 0);
 #endif
   if (memfd < 0) {
-#ifdef O_TMPFILE
+#if defined(__APPLE__)
+    char memname[255];
+    sprintf(memname, "/fb_heap.%d", getpid());
+    memfd = shm_open(memname, O_CREAT | O_RDWR, 0666);
+    if (memfd < 0) {
+        uerror("shm_open", Nothing);
+    }
+#elif defined(O_TMPFILE)
     memfd = open(shm_dir, O_TMPFILE|O_RDWR|O_CLOEXEC|O_EXCL, 0666);
     if (memfd < 0) {
         uerror("shm_open", Nothing);
@@ -429,16 +436,17 @@ static void memfd_reserve(char * mem, size_t sz) {
 #elif defined(__APPLE__)
 
 static void memfd_reserve(char * mem, size_t sz) {
-  fstore_t store = { F_ALLOCATECONTIG, F_PEOFPOSMODE,
-                     (uint64_t)(mem - SHARED_MEM_INIT), sz };
-  int ret = fcntl(memfd, F_PREALLOCATE, &store);
-  if (ret == -1) {
-    store.fst_flags = F_ALLOCATEALL;
-    ret = fcntl(memfd, F_PREALLOCATE, &store);
-    if (ret == -1) {
-      uerror("preallocate", Nothing);
-    }
-  }
+  // TODO ??
+  /* fstore_t store = { F_ALLOCATECONTIG, F_PEOFPOSMODE, */
+  /*                    (uint64_t)(mem - SHARED_MEM_INIT), sz }; */
+  /* int ret = fcntl(memfd, F_PREALLOCATE, &store); */
+  /* if (ret == -1) { */
+  /*   store.fst_flags = F_ALLOCATEALL; */
+  /*   ret = fcntl(memfd, F_PREALLOCATE, &store); */
+  /*   if (ret == -1) { */
+  /*     uerror("preallocate", Nothing); */
+  /*   } */
+  /* } */
 }
 
 #else
