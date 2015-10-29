@@ -85,6 +85,7 @@ OCAML_LIBRARIES=\
 
 NATIVE_LIBRARIES=\
   pthread\
+  rt\
   $(ELF)
 
 TARGETS=_build/hh_server.native _build/hh_client.native \

@@ -104,6 +104,24 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#ifdef HAVE_MEMFD_CREATE
+#include <sys/memfd.h>
+#else
+#if HAVE_DECL___NR_MEMFD_CREATE
+#define HAVE_MEMFD_CREATE 1
+#include <asm/unistd.h>
+static int memfd_create(const char *name, unsigned int flags)
+{
+  return syscall(__NR_memfd_create, name, flags);
+}
+#endif
+#endif
+
+#ifdef __O_TMPFILE
+#define O_TMPFILE __O_TMPFILE
+#endif
+
 #endif
 
 // The following 'typedef' won't be required anymore
@@ -170,7 +188,7 @@ static size_t heap_size;
 
 /* Fix the location of our shared memory so we can save and restore the
  * hashtable easily */
-#define SHARED_MEM_INIT 0x500000000000ll
+#define SHARED_MEM_INIT ((char *)0x500000000000ll)
 
 /* As a sanity check when loading from a file */
 static uint64_t MAGIC_CONSTANT = 0xfacefacefaceb000ll;
@@ -264,31 +282,172 @@ struct timeval log_duration(const char *prefix, struct timeval start_t) {
   return end_t;
 }
 
+
+
+/**************************************************************************
+
+     We create an anonymous memory file, whose `handle` might be
+     inherited by slave processes.
+
+     This memory file is tagged "reserved" but not "committed". This
+     means that the memory space will be reserved in the virtual
+     memory table but the pages will not be bound to any physical
+     memory yet. Further calls to 'VirtualAlloc' will "commit" pages,
+     meaning they will be bound to physical memory.
+
+     This is behavior that should reflect the 'MAP_NORESERVE' flag of
+     'mmap' on Unix. But, on Unix, the "commit" is implicit.
+
+     Committing the whole shared heap at once would require the same
+     amount of free space in memory (or in swap file).
+
+**************************************************************************/
+
+#ifdef _WIN32
+
+static HANDLE memfd;
+
+void memfd_init(char *shm_dir, size_t shared_mem_size) {
+  memfd = CreateFileMapping(
+    INVALID_HANDLE_VALUE,
+    NULL,
+    PAGE_READWRITE | SEC_RESERVE,
+    shared_mem_size >> 32, shared_mem_size & ((1ll << 32) - 1),
+    NULL);
+  if (memfd == NULL) {
+    win32_maperr(GetLastError());
+    uerror("CreateFileMapping", Nothing);
+  }
+  if (!SetHandleInformation(memfd, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+    win32_maperr(GetLastError());
+    uerror("SetHandleInformation", Nothing);
+  }
+}
+
+#else
+
+static int memfd = -1;
+
+void memfd_init(char *shm_dir, size_t shared_mem_size) {
+#if defined(HAVE_MEMFD_CREATE)
+  memfd = memfd_create("fb_heap", 0);
+#endif
+  if (memfd < 0) {
+#ifdef O_TMPFILE
+    memfd = open(shm_dir, O_TMPFILE|O_RDWR|O_CLOEXEC|O_EXCL, 0666);
+    if (memfd < 0) {
+        uerror("shm_open", Nothing);
+    }
+#endif
+    if (memfd < 0) {
+      char template[1024];
+      if (!sprintf(template,  "%s/fb_heap-XXXXXX", shm_dir)) {
+        uerror("sprintf", Nothing);
+      };
+      memfd = mkstemp(template);
+      if (memfd < 0) {
+        uerror("mkstemp", Nothing);
+      }
+      unlink(template);
+    }
+  }
+  if(ftruncate(memfd, shared_mem_size) == -1) {
+    uerror("ftruncate", Nothing);
+  }
+}
+
+#endif
+
+
 /*****************************************************************************/
 /* Given a pointer to the shared memory address space, initializes all
  * the globals that live in shared memory.
  */
 /*****************************************************************************/
 
-static void init_shared_globals(char* mem) {
-  size_t page_size = getpagesize();
-
 #ifdef _WIN32
-  if (!VirtualAlloc(mem,
-                    global_size_b + page_size +
-                      2 * DEP_SIZE_B + HASHTBL_SIZE_B,
-                    MEM_COMMIT, PAGE_READWRITE)) {
+
+static char *memfd_map(size_t shared_mem_size) {
+  char *mem;
+  mem = MapViewOfFileEx(
+    memfd,
+    FILE_MAP_ALL_ACCESS,
+    0, 0,
+    0,
+    SHARED_MEM_INIT);
+  if (mem != SHARED_MEM_INIT) {
     win32_maperr(GetLastError());
-    uerror("VirtualAlloc2", Nothing);
+    uerror("MapViewOfFileEx", Nothing);
   }
+  return mem;
+}
+
+#else
+
+static char *memfd_map(size_t shared_mem_size) {
+  char *mem;
+  /* MAP_NORESERVE is because we want a lot more virtual memory than what
+   * we are actually going to use.
+   */
+  int flags = MAP_SHARED | MAP_NORESERVE | MAP_FIXED;
+  int prot  = PROT_READ  | PROT_WRITE;
+  mem =
+    (char*)mmap((void*)SHARED_MEM_INIT, shared_mem_size, prot,
+                flags, memfd, 0);
+  if(mem == MAP_FAILED) {
+    printf("Error initializing: %s\n", strerror(errno));
+    exit(2);
+  }
+  return mem;
+}
+
 #endif
 
-  /* Global storage initialization:
-   * We store this at the start of the shared memory section as it never
-   * needs to get saved (always reset after each typechecking run) */
+
+/*********************************************/
+/* Force allocation of (mem -> mem+sz)       */
+/* in a mmaped segment that begin at `start` */
+/*********************************************/
+
+#ifdef _WIN32
+
+static void memfd_reserve(char * mem, size_t sz) {
+  if (!VirtualAlloc(mem, sz, MEM_COMMIT, PAGE_READWRITE)) {
+    win32_maperr(GetLastError());
+    uerror("VirtualAlloc", Nothing);
+  }
+}
+
+#elif defined(__APPLE__)
+
+static void memfd_reserve(char * mem, size_t sz) {
+  fstore_t store = { F_ALLOCATECONTIG, F_PEOFPOSMODE,
+                     (uint64_t)(mem - SHARED_MEM_INIT), sz };
+  int ret = fcntl(memfd, F_PREALLOCATE, &store);
+  if (ret == -1) {
+    store.fst_flags = F_ALLOCATEALL;
+    ret = fcntl(memfd, F_PREALLOCATE, &store);
+    if (ret == -1) {
+      uerror("preallocate", Nothing);
+    }
+  }
+}
+
+#else
+
+static void memfd_reserve(char *mem, size_t sz) {
+  if(posix_fallocate(memfd, (uint64_t)(mem - SHARED_MEM_INIT), sz)) {
+      uerror("fallocate", Nothing);
+  }
+}
+
+#endif
+
+
+static void define_globals(char * shared_mem) {
+  size_t page_size = getpagesize();
+  char *mem = shared_mem;
   global_storage = (value*)mem;
-  // Initial size is zero
-  global_storage[0] = 0;
   mem += global_size_b;
 
   /* BEGINNING OF THE SMALL OBJECTS PAGE
@@ -304,10 +463,7 @@ static void init_shared_globals(char* mem) {
 
   // The number of elements in the hashtable
   hcounter = (int*)(mem + CACHE_LINE_SIZE);
-  *hcounter = 0;
-
   counter = (uintptr_t*)(mem + 2*CACHE_LINE_SIZE);
-  *counter = early_counter + 1;
 
   mem += page_size;
   // Just checking that the page is large enough.
@@ -327,12 +483,47 @@ static void init_shared_globals(char* mem) {
 
   /* Heap */
   heap_init = mem;
-  *heap = mem;
+
+  /* Reserve all memory space except the "huge" `global_size_b`. */
+  memfd_reserve((char *)global_storage, sizeof(global_storage[0]));
+  memfd_reserve((char *)heap, heap_init - (char *)heap);
+
 }
+
+static void init_shared_globals(char * mem) {
+  // Initial size is zero for global storage is zero
+  global_storage[0] = 0;
+  // Initialize the number of element in the table
+  *hcounter = 0;
+  *counter = early_counter + 1;
+  // Initialize top heap pointers
+  *heap = heap_init;
+}
+
 
 /*****************************************************************************/
 /* Sets CPU and IO priorities. */
 /*****************************************************************************/
+
+// Downgrade to lowest IO priority. We fork a process for each CPU, which
+// during parsing can slam the disk so hard that the system becomes
+// unresponsive. While it's unclear why the Linux IO scheduler can't deal with
+// this better, increasing our startup time in return for a usable system
+// while we start up is the right tradeoff. (Especially in Facebook's
+// configuration, where hh_server is often started up in the background well
+// before the user needs hh_client, so our startup time often doesn't matter
+// at all!)
+//
+// No need to check the return value, if we failed then whatever.
+
+#ifdef _WIN32
+
+static void set_priorities() {
+  // One might also try: PROCESS_MODE_BACKGROUND_BEGIN
+  SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+}
+
+#else
 
 // glibc refused to add ioprio_set, sigh.
 // https://sourceware.org/bugzilla/show_bug.cgi?id=4464
@@ -342,16 +533,6 @@ static void init_shared_globals(char* mem) {
 #define IOPRIO_CLASS_IDLE 3
 
 static void set_priorities() {
-  // Downgrade to lowest IO priority. We fork a process for each CPU, which
-  // during parsing can slam the disk so hard that the system becomes
-  // unresponsive. While it's unclear why the Linux IO scheduler can't deal with
-  // this better, increasing our startup time in return for a usable system
-  // while we start up is the right tradeoff. (Especially in Facebook's
-  // configuration, where hh_server is often started up in the background well
-  // before the user needs hh_client, so our startup time often doesn't matter
-  // at all!)
-  //
-  // No need to check the return value, if we failed then whatever.
   #ifdef __linux__
   syscall(
     SYS_ioprio_set,
@@ -363,14 +544,18 @@ static void set_priorities() {
 
   // Don't slam the CPU either, though this has much less tendency to make the
   // system totally unresponsive so we don't need to lower all the way.
-  #ifdef _WIN32
-  SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-  // One might also try: PROCESS_MODE_BACKGROUND_BEGIN
-  #else
   int dummy = nice(10);
   (void)dummy; // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=25509
-  #endif
+}
 
+#endif
+
+/* The total size of the shared memory.  Most of it is going to remain
+ * virtual. */
+static size_t get_shared_mem_size() {
+  size_t page_size = getpagesize();
+  return (global_size_b + 2 * DEP_SIZE_B + HASHTBL_SIZE_B +
+          heap_size + page_size);
 }
 
 /*****************************************************************************/
@@ -379,84 +564,29 @@ static void set_priorities() {
 
 value hh_shared_init(
   value global_size_val,
-  value heap_size_val
+  value heap_size_val,
+  value shm_dir_val
 ) {
 
-  CAMLparam2(global_size_val, heap_size_val);
+  CAMLparam3(global_size_val, heap_size_val, shm_dir_val);
+  CAMLlocal1(connector);
 
   global_size_b = Long_val(global_size_val);
   heap_size = Long_val(heap_size_val);
 
-  char* shared_mem;
+  size_t shared_mem_size = get_shared_mem_size();
+  memfd_init(String_val(shm_dir_val), shared_mem_size);
+  char* shared_mem = memfd_map(shared_mem_size);
+  define_globals(shared_mem);
 
-  size_t page_size = getpagesize();
-
-  /* The total size of the shared memory.  Most of it is going to remain
-   * virtual. */
-  size_t shared_mem_size =
-    global_size_b + 2 * DEP_SIZE_B + HASHTBL_SIZE_B +
-    heap_size + page_size;
-
+  // Keeping the pids around to make asserts.
 #ifdef _WIN32
-  /*
-
-     We create an anonymous memory file, whose `handle` might be
-     inherited by slave processes.
-
-     This memory file is tagged "reserved" but not "committed". This
-     means that the memory space will be reserved in the virtual
-     memory table but the pages will not be bound to any physical
-     memory yet. Further calls to 'VirtualAlloc' will "commit" pages,
-     meaning they will be bound to physical memory.
-
-     This is behavior that should reflect the 'MAP_NORESERVE' flag of
-     'mmap' on Unix. But, on Unix, the "commit" is implicit.
-
-     Committing the whole shared heap at once would require the same
-     amount of free space in memory (or in swap file).
-
-  */
-  HANDLE handle = CreateFileMapping(
-    INVALID_HANDLE_VALUE,
-    NULL,
-    PAGE_READWRITE | SEC_RESERVE,
-    shared_mem_size >> 32, shared_mem_size & ((1ll << 32) - 1),
-    NULL);
-  if (handle == NULL) {
-    win32_maperr(GetLastError());
-    uerror("CreateFileMapping", Nothing);
-  }
-  if (!SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
-    win32_maperr(GetLastError());
-    uerror("SetHandleInformation", Nothing);
-  }
-  shared_mem = MapViewOfFileEx(
-    handle,
-    FILE_MAP_ALL_ACCESS,
-    0, 0,
-    0,
-    (char *)SHARED_MEM_INIT);
-  if (shared_mem != (char *)SHARED_MEM_INIT) {
-    shared_mem = NULL;
-    win32_maperr(GetLastError());
-    uerror("MapViewOfFileEx", Nothing);
-  }
-
-#else /* _WIN32 */
-
-  /* MAP_NORESERVE is because we want a lot more virtual memory than what
-   * we are actually going to use.
-   */
-  int flags = MAP_SHARED | MAP_ANON | MAP_NORESERVE | MAP_FIXED;
-  int prot  = PROT_READ  | PROT_WRITE;
-
-  shared_mem =
-    (char*)mmap((void*)SHARED_MEM_INIT,  shared_mem_size, prot,
-                flags, 0, 0);
-  if(shared_mem == MAP_FAILED) {
-    printf("Error initializing: %s\n", strerror(errno));
-    exit(2);
-  }
+  master_pid = 0;
+  my_pid = master_pid;
+#else
+  master_pid = getpid();
+  my_pid = master_pid;
+#endif
 
 #ifdef MADV_DONTDUMP
   // We are unlikely to get much useful information out of the shared heap in
@@ -466,17 +596,9 @@ value hh_shared_init(
   madvise(shared_mem, shared_mem_size, MADV_DONTDUMP);
 #endif
 
-  // Keeping the pids around to make asserts.
-  master_pid = getpid();
-  my_pid = master_pid;
-
-#endif /* _WIN32 */
-
-  char* bottom = shared_mem;
   init_shared_globals(shared_mem);
-
   // Checking that we did the maths correctly.
-  assert(*heap + heap_size == bottom + shared_mem_size);
+  assert(*heap + heap_size == shared_mem + shared_mem_size);
 
 #ifndef _WIN32
   // Uninstall ocaml's segfault handler. It's supposed to throw an exception on
@@ -492,14 +614,29 @@ value hh_shared_init(
 
   set_priorities();
 
-  CAMLreturn(Val_unit);
+  connector = caml_alloc_tuple(3);
+  Field(connector, 0) = Val_long(memfd);
+  Field(connector, 1) = global_size_val;
+  Field(connector, 2) = heap_size_val;
+
+  CAMLreturn(connector);
 }
 
 /* Must be called by every worker before any operation is performed */
-void hh_worker_init() {
-#ifndef _WIN32
+value hh_worker_init(value connector) {
+  CAMLparam1(connector);
+  global_size_b = Long_val(Field(connector, 1));
+  heap_size = Long_val(Field(connector, 2));
+#ifdef _WIN32
+  memfd = (HANDLE)Long_val(Field(connector, 0));
+  my_pid = 1; // Trick
+#else
+  memfd = Long_val(Field(connector, 0));
   my_pid = getpid();
 #endif
+  char* shared_mem = memfd_map(get_shared_mem_size());
+  define_globals(shared_mem);
+  CAMLreturn(Val_unit);
 }
 
 /*****************************************************************************/
@@ -541,6 +678,7 @@ void hh_shared_store(value data) {
   assert(size < global_size_b - sizeof(value));  // Do we have enough space?
 
   global_storage[0] = size;
+  memfd_reserve((char *)&global_storage[1], size);
   memcpy(&global_storage[1], &Field(data, 0), size);
 }
 
@@ -764,12 +902,7 @@ void hh_collect(value aggressive_val) {
 static char* hh_alloc(size_t size) {
   size_t slot_size  = ALIGNED(size + sizeof(size_t));
   char* chunk       = __sync_fetch_and_add(heap, slot_size);
-#ifdef _WIN32
-  if (!VirtualAlloc(chunk, slot_size, MEM_COMMIT, PAGE_READWRITE)) {
-    win32_maperr(GetLastError());
-    uerror("VirtualAlloc1", Nothing);
-  }
-#endif
+  memfd_reserve(chunk, slot_size);
   *((size_t*)chunk) = size;
   return (chunk + sizeof(size_t));
 }

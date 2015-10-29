@@ -98,6 +98,9 @@ end
 module Program =
   struct
     let preinit () =
+      (* Warning: Global references inited in this function, should
+         be 'restored' in the workers, because they are not 'forked'
+         anymore. See `ServerWorker.{save/restore}_state`. *)
       HackSearchService.attach_hooks ();
       (* Force hhi files to be extracted and their location saved before workers
        * fork, so everyone can know about the same hhi path. *)
@@ -112,9 +115,11 @@ module Program =
         (List.map env.errorl Errors.to_absolute) stdout;
       match ServerArgs.convert genv.options with
       | None ->
+         Worker.killall ();
          exit (if env.errorl = [] then 0 else 1)
       | Some dirname ->
          ServerConvert.go genv env dirname;
+         Worker.killall ();
          exit 0
 
     (* filter and relativize updated file paths *)
@@ -312,13 +317,13 @@ let load genv filename to_recheck =
 let run_load_script genv cmd =
   try
     let t = Unix.gettimeofday () in
-    let cmd =
+    let str_cmd =
       sprintf
         "%s %s %s"
         (Filename.quote (Path.to_string cmd))
         (Filename.quote (Path.to_string (ServerArgs.root genv.options)))
         (Filename.quote Build_id.build_id_ohai) in
-    Hh_logger.log "Running load script: %s\n%!" cmd;
+    Hh_logger.log "Running load script: %s\n%!" str_cmd;
     let state_fn, to_recheck =
       let reader timeout ic _oc =
         let state_fn =
@@ -342,7 +347,10 @@ let run_load_script genv cmd =
         ~timeout:(ServerConfig.load_script_timeout genv.config)
         ~on_timeout:(fun _ -> failwith "Load script timed out")
         ~reader
-        cmd [| cmd |] in
+        (Path.to_string cmd)
+        [| Path.to_string cmd ;
+           Path.to_string (ServerArgs.root genv.options) ;
+           Build_id.build_id_ohai |] in
     Hh_logger.log
       "Load state found at %s. %d files to recheck\n%!"
       state_fn (List.length to_recheck);
@@ -404,7 +412,7 @@ let program_init genv =
   env
 
 let save_complete env fn =
-  let chan = open_out_no_fail fn in
+  let chan = open_out_bin_no_fail fn in
   Marshal.to_channel chan env [];
   Program.marshal chan;
   close_out_no_fail fn chan;
@@ -448,14 +456,17 @@ let daemon_main options =
         let fd = Handle.wrap_handle handle in
         Unix.set_close_on_exec fd);
   Program.preinit ();
-  SharedMem.init (ServerConfig.sharedmem_config config);
+  let handle =
+    SharedMem.init
+      (ServerConfig.sharedmem_config config)
+      local_config.ServerLocalConfig.shm_dir in
   (* this is to transform SIGPIPE in an exception. A SIGPIPE can happen when
    * someone C-c the client.
    *)
   if not Sys.win32 then Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   PidLog.init (ServerFiles.pids_file root);
   PidLog.log ~reason:"main" (Unix.getpid());
-  let genv = ServerEnvBuild.make_genv options config local_config in
+  let genv = ServerEnvBuild.make_genv options config local_config handle in
   let is_check_mode = ServerArgs.check_mode genv.options in
   if is_check_mode then
     let env = program_init genv in

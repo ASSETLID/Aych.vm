@@ -228,3 +228,6 @@ let close { channels = (ic, oc); _ } =
 let kill h =
   close h;
   Sys_utils.terminate_process h.pid
+
+let cast_in x = x
+let cast_out x = x

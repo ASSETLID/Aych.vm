@@ -16,6 +16,7 @@ type t = {
   use_mini_state: bool;
   load_mini_script_timeout: int; (* in seconds *)
   type_decl_bucket_size: int;
+  shm_dir: string;
 }
 
 let default = {
@@ -24,6 +25,7 @@ let default = {
   use_mini_state = false;
   load_mini_script_timeout = 20;
   type_decl_bucket_size = 1000;
+  shm_dir = GlobalConfig.shm_dir;
 }
 
 let path =
@@ -45,12 +47,14 @@ let load_ fn =
   (* Buck and hgwatchman use a 10 second timeout too *)
   let watchman_init_timeout =
     int_ "watchman_init_timeout" ~default:10 config in
+  let shm_dir = string_ "shm_dir" ~default:default.shm_dir config in
   {
     use_watchman;
     watchman_init_timeout;
     use_mini_state;
     load_mini_script_timeout;
     type_decl_bucket_size;
+    shm_dir;
   }
 
 let load () =
