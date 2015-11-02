@@ -211,8 +211,8 @@ let spawn
 
 (* for testing code *)
 let devnull () =
-  let ic = Timeout.open_in "/dev/null" in
-  let oc = open_out "/dev/null" in
+  let ic = Timeout.open_in Path.(to_string null_path) in
+  let oc = open_out Path.(to_string null_path) in
   {channels = ic, oc; pid = 0}
 
 let check_entry_point () =
